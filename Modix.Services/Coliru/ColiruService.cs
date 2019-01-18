@@ -37,13 +37,13 @@ namespace Modix.Services.Coliru
                 int main() {
                     std::cout<<""Hello World!"";
                 }
-                ```).", false);
+                \`\`\`).", false);
             }
 
             if (Enum.TryParse<SupportedLangs>(FormatUtilities.GetCodeLanguage(codeBlock.First()), out var result))
             {
-                string code = string.Join(Environment.NewLine, codeBlock);
-                code = code.Substring(code.IndexOf("```") + 3, code.LastIndexOf("```"));
+                string code = string.Join(Environment.NewLine, codeBlock.Skip(1));
+                code = code.Substring(0, code.LastIndexOf("```") - 3);
                 HttpResponseMessage response = await _client.PostAsync(coliruMain, new StringContent(JsonConvert.SerializeObject(new { cmd = commands[result], src = code })));
                 return (await response.Content?.ReadAsStringAsync(), response.IsSuccessStatusCode);
             }
