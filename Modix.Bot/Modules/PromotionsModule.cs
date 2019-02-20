@@ -5,7 +5,9 @@ using System.Threading.Tasks;
 using Discord;
 using Discord.Commands;
 
+using Modix.Bot.Extensions;
 using Modix.Data.Models.Promotions;
+using Modix.Data.Utilities;
 using Modix.Services.Promotions;
 
 namespace Modix.Modules
@@ -43,23 +45,16 @@ namespace Modix.Modules
 
             foreach (var campaign in campaigns)
             {
-                var totalVotes = campaign.CommentCounts
-                    .Select(x => x.Value)
-                    .Sum();
-                var totalApprovals = campaign.CommentCounts
-                    .Where(x => x.Key == PromotionSentiment.Approve)
-                    .Select(x => x.Value)
-                    .Sum();
-                var approvalPercentage = Math.Round((float)totalApprovals / totalVotes * 100);
-
                 var idLabel = $"#{campaign.Id}";
-                var votesLabel = (totalVotes == 1) ? "Vote" : "Votes";
-                var approvalLabel = Format.Italics($"{approvalPercentage}% approval");
+                var votesLabel = (campaign.GetTotalVotes() == 1) ? "Vote" : "Votes";
+
+                var percentage = Math.Round(campaign.GetApprovalPercentage() * 100);
+                var approvalLabel = Format.Italics($"{percentage}% approval");
 
                 embed.AddField(new EmbedFieldBuilder()
                 {
                     Name = $"{Format.Bold(idLabel)}: For {Format.Bold(campaign.Subject.DisplayName)} to {Format.Bold(campaign.TargetRole.Name)}",
-                    Value = $"{totalVotes} {votesLabel} ({approvalLabel})",
+                    Value = $"{campaign.GetTotalVotes()} {votesLabel} ({approvalLabel})",
                     IsInline = false
                 });
             }
@@ -75,52 +70,9 @@ namespace Modix.Modules
             [Remainder]
             [Summary("A comment to be attached to the new campaign")]
                 string comment)
-        {
-            await PromotionsService.CreateCampaignAsync(subject.Id, comment, c => Confirm(c));
-
-            async Task<bool> Confirm(ProposedPromotionCampaignBrief proposedPromotionCampaign)
-            {
-                var confirmEmote = new Emoji("✅");
-                var cancelEmote = new Emoji("❌");
-                const int secondsToWait = 10;
-
-                var nominationInfo = $"You are nominating user {subject.Id} for promotion to rank {proposedPromotionCampaign.TargetRankRole.Name}.{Environment.NewLine}";
-
-                var confirmationMessage = await ReplyAsync(nominationInfo +
-                    $"React with {confirmEmote} or {cancelEmote} in the next {secondsToWait} seconds to finalize or cancel creation of the campaign.");
-
-                await confirmationMessage.AddReactionAsync(confirmEmote);
-                await confirmationMessage.AddReactionAsync(cancelEmote);
-
-                for (var i = 0; i < secondsToWait; i++)
-                {
-                    await Task.Delay(1000);
-
-                    var cancelingUsers = await confirmationMessage.GetReactionUsersAsync(cancelEmote, int.MaxValue).FlattenAsync();
-                    if (cancelingUsers.Any(u => u.Id == proposedPromotionCampaign.NominatingUserId))
-                    {
-                        await RemoveReactionsAndUpdateMessage("Cancellation was successfully received. Cancelling promotion campaign.");
-                        return false;
-                    }
-
-                    var confirmingUsers = await confirmationMessage.GetReactionUsersAsync(confirmEmote, int.MaxValue).FlattenAsync();
-                    if (confirmingUsers.Any(u => u.Id == proposedPromotionCampaign.NominatingUserId))
-                    {
-                        await RemoveReactionsAndUpdateMessage("Confirmation was succesfully received. Creating promotion campaign.");
-                        return true;
-                    }
-                }
-
-                await RemoveReactionsAndUpdateMessage("Confirmation was not received. Cancelling promotion campaign.");
-                return false;
-
-                async Task RemoveReactionsAndUpdateMessage(string bottomMessage)
-                {
-                    await confirmationMessage.RemoveAllReactionsAsync();
-                    await confirmationMessage.ModifyAsync(m => m.Content = nominationInfo + bottomMessage);
-                }
-            }
-        }
+            => await PromotionsService.CreateCampaignAsync(subject.Id, comment,
+                c => Context.GetUserConfirmationAsync(
+                    $"You are nominating user {subject.Id} for promotion to rank {c.TargetRankRole.Name}.{Environment.NewLine}"));
 
         [Command("comment")]
         [Summary("Comment on an ongoing campaign to promote a user.")]
@@ -175,8 +127,10 @@ namespace Modix.Modules
         [Summary("Accept an ongoing campaign to promote a user, and perform the promotion.")]
         public Task Accept(
             [Summary("The ID value of the campaign to be accepted.")]
-                long campaignId)
-            => PromotionsService.AcceptCampaignAsync(campaignId);
+                long campaignId,
+            [Summary("Whether to bypass the time restriction on campaign acceptance")]
+                bool force = false)
+            => PromotionsService.AcceptCampaignAsync(campaignId, force);
 
         [Command("reject")]
         [Summary("Reject an ongoing campaign to promote a user.")]

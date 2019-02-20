@@ -1,6 +1,8 @@
 ﻿using System;
 using System.Globalization;
+using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Text;
 using System.Threading.Tasks;
 using Discord;
@@ -25,6 +27,9 @@ namespace Modix.Modules
         //optimization: UtcNow is slow and the module is created per-request
         private readonly DateTime _utcNow = DateTime.UtcNow;
 
+        // TODO: Factor this out into a common botwide client.
+        private static readonly HttpClient _httpClient = new HttpClient();
+
         public UserInfoModule(ILogger<UserInfoModule> logger, IUserService userService, IModerationService moderationService, IAuthorizationService authorizationService, IMessageRepository messageRepository)
         {
             Log = logger ?? new NullLogger<UserInfoModule>();
@@ -41,35 +46,52 @@ namespace Modix.Modules
         private IMessageRepository MessageRepository { get; }
 
         [Command("info")]
-        public async Task GetUserInfo(IGuildUser user = null)
+        public async Task GetUserInfoAsync(DiscordUserEntity user = null)
         {
-            await GetUserInfoFromId(user?.Id ?? Context.User.Id);
-        }
+            user = user ?? new DiscordUserEntity(Context.User.Id);
 
-        [Command("info")]
-        public async Task GetUserInfoFromId(ulong userId)
-        {
-            var userSummary = await UserService.GetGuildUserSummaryAsync(Context.Guild.Id, userId);
+            var userInfo = await UserService.GetUserInformationAsync(Context.Guild.Id, user.Id);
 
-            if (userSummary == null)
+            if (userInfo == null)
             {
-                await ReplyAsync("We don't have any data for that user.");
+                await ReplyAsync("", embed: new EmbedBuilder()
+                    .WithTitle("Retrieval Error")
+                    .WithColor(Color.Red)
+                    .WithDescription("Sorry, we don't have any data for that user - and we couldn't find any, either.")
+                    .AddField("User Id", user.Id)
+                    .Build());
+
                 return;
             }
 
             var builder = new StringBuilder();
             builder.AppendLine("**\u276F User Information**");
-            builder.AppendLine("ID: " + userSummary.UserId);
-            builder.AppendLine("Profile: " + MentionUtils.MentionUser(userSummary.UserId));
+            builder.AppendLine("ID: " + userInfo.Id);
+            builder.AppendLine("Profile: " + MentionUtils.MentionUser(userInfo.Id));
 
-            // TODO: Add content about the user's presence, if any
+            if (userInfo.IsBanned)
+            {
+                builder.AppendLine("Status: **Banned** \\🔨");
 
-            builder.Append(FormatTimeAgo("First Seen", userSummary.FirstSeen));
-            builder.Append(FormatTimeAgo("Last Seen", userSummary.LastSeen));
+                if (await AuthorizationService.HasClaimsAsync(Context.User as IGuildUser, AuthorizationClaim.ModerationRead))
+                {
+                    builder.AppendLine($"Ban Reason: {userInfo.BanReason}");
+                }
+            }
+            else
+            {
+                builder.AppendLine($"Status: {userInfo.Status.Humanize()}");
+            }
+
+            if (userInfo.FirstSeen is DateTimeOffset firstSeen)
+                builder.Append(FormatTimeAgo("First Seen", firstSeen));
+
+            if (userInfo.LastSeen is DateTimeOffset lastSeen)
+                builder.Append(FormatTimeAgo("Last Seen", lastSeen));
 
             try
             {
-                await AddParticipationToEmbed(userId, builder);
+                await AddParticipationToEmbedAsync(user.Id, builder);
             }
             catch (Exception ex)
             {
@@ -77,24 +99,19 @@ namespace Modix.Modules
             }
 
             var embedBuilder = new EmbedBuilder()
-                .WithAuthor(userSummary.Username + "#" + userSummary.Discriminator)
-                .WithColor(new Color(253, 95, 0))
+                .WithAuthor(userInfo.Username + "#" + userInfo.Discriminator)
                 .WithTimestamp(_utcNow);
 
-            if (await UserService.GuildUserExistsAsync(Context.Guild.Id, userId))
-            {
-                var member = await UserService.GetGuildUserAsync(Context.Guild.Id, userId);
-                AddMemberInformationToEmbed(member, builder, embedBuilder);
-            }
-            else
-            {
-                builder.AppendLine();
-                builder.AppendLine("**\u276F No Member Information**");
-            }
+            var avatar = userInfo.GetAvatarUrl() ?? userInfo.GetDefaultAvatarUrl();
+
+            embedBuilder.ThumbnailUrl = avatar;
+            embedBuilder.Author.IconUrl = avatar;
+
+            await AddMemberInformationToEmbedAsync(userInfo, builder, embedBuilder);
 
             if (await AuthorizationService.HasClaimsAsync(Context.User as IGuildUser, AuthorizationClaim.ModerationRead))
             {
-                await AddInfractionsToEmbed(userId, builder);
+                await AddInfractionsToEmbedAsync(user.Id, builder);
             }
 
             embedBuilder.Description = builder.ToString();
@@ -102,7 +119,7 @@ namespace Modix.Modules
             await ReplyAsync(string.Empty, embed: embedBuilder.Build());
         }
 
-        private void AddMemberInformationToEmbed(IGuildUser member, StringBuilder builder, EmbedBuilder embedBuilder)
+        private async Task AddMemberInformationToEmbedAsync(EphemeralUser member, StringBuilder builder, EmbedBuilder embedBuilder)
         {
             builder.AppendLine();
             builder.AppendLine("**\u276F Member Information**");
@@ -119,7 +136,7 @@ namespace Modix.Modules
                 builder.Append(FormatTimeAgo("Joined", joinedAt));
             }
 
-            if (member.RoleIds.Count > 0)
+            if (member.RoleIds?.Count > 0)
             {
                 var roles = member.RoleIds.Select(x => member.Guild.Roles.Single(y => y.Id == x))
                     .Where(x => x.Id != x.Guild.Id) // @everyone role always has same ID than guild
@@ -135,12 +152,23 @@ namespace Modix.Modules
                 }
             }
 
-            embedBuilder.Color = GetDominantColor(member);
-            embedBuilder.ThumbnailUrl = member.GetAvatarUrl();
-            embedBuilder.Author.IconUrl = member.GetAvatarUrl();
+            if ((member.GetAvatarUrl(size: 16) ?? member.GetDefaultAvatarUrl()) is string avatarUrl)
+            {
+                using (var httpStream = await _httpClient.GetStreamAsync(avatarUrl))
+                {
+                    using (var avatarStream = new MemoryStream())
+                    {
+                        await httpStream.CopyToAsync(avatarStream);
+
+                        var avatar = new Image(avatarStream);
+
+                        embedBuilder.WithColor(FormatUtilities.GetDominantColor(avatar));
+                    }
+                }
+            }
         }
 
-        private async Task AddInfractionsToEmbed(ulong userId, StringBuilder builder)
+        private async Task AddInfractionsToEmbedAsync(ulong userId, StringBuilder builder)
         {
             builder.AppendLine();
             builder.AppendLine($"**\u276F Infractions [See here](https://mod.gg/infractions?subject={userId})**");
@@ -150,7 +178,7 @@ namespace Modix.Modules
             builder.AppendLine(FormatUtilities.FormatInfractionCounts(counts));
         }
 
-        private async Task AddParticipationToEmbed(ulong userId, StringBuilder builder)
+        private async Task AddParticipationToEmbedAsync(ulong userId, StringBuilder builder)
         {
             var messagesByDate = await MessageRepository.GetGuildUserMessageCountByDate(Context.Guild.Id, userId, TimeSpan.FromDays(30));
 
@@ -206,12 +234,6 @@ namespace Modix.Modules
                 : "a few seconds";
 
             return string.Format(CultureInfo.InvariantCulture, Format, prefix, humanizedTimeAgo, ago.UtcDateTime);
-        }
-
-        private static Color GetDominantColor(IUser user)
-        {
-            // TODO: Get the dominate image in the user's avatar.
-            return new Color(253, 95, 0);
         }
     }
 }

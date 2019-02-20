@@ -94,6 +94,35 @@ namespace Modix.Services.Moderation
         Task DeleteMessageAsync(IMessage message, string reason);
 
         /// <summary>
+        /// Mass-deletes a specified number of messages.
+        /// </summary>
+        /// <param name="channel">The channel in which the messages are to be deleted.</param>
+        /// <param name="count">The number of messages to delete.</param>
+        /// <param name="skipOne">Indicates whether to skip one message (i.e. the command message) before deleting.</param>
+        /// <param name="confirmDelegate">A delegate that is invoked to confirm whether to proceed with the operation.</param>
+        /// <returns>A <see cref="Task"/> that will complete when the operation has completed.</returns>
+        Task DeleteMessagesAsync(ITextChannel channel, int count, bool skipOne, Func<Task<bool>> confirmDelegate);
+
+        /// <summary>
+        /// Mass-deletes a specified number of messages.
+        /// </summary>
+        /// <param name="channel">The channel in which the messages are to be deleted.</param>
+        /// <param name="user">The user whose messages are to be deleted.</param>
+        /// <param name="count">The number of messages to delete.</param>
+        /// <param name="confirmDelegate">A delegate that is invoked to confirm whether to proceed with the operation.</param>
+        /// <returns>A <see cref="Task"/> that will complete when the operation has completed.</returns>
+        Task DeleteMessagesAsync(ITextChannel channel, IGuildUser user, int count, Func<Task<bool>> confirmDelegate);
+
+        /// <summary>
+        /// Retrieves a collection of deleted messages based on a given set of criteria, and returns a paged subset of the results based on a given set of paging criteria.
+        /// </summary>
+        /// <param name="searchCriteria">The criteria defining which deleted messages are to be returned.</param>
+        /// <param name="sortingCriteria">The criteria defining how to sort the deleted messages to be returned.</param>
+        /// <param name="pagingCriteria">The criteria defining how to page the deleted messages to be returned.</param>
+        /// <returns>A <see cref="Task"/> which will complete when the operation has completed, containing the requested set of deleted messages.</returns>
+        Task<RecordsPage<DeletedMessageSummary>> SearchDeletedMessagesAsync(DeletedMessageSearchCriteria searchCriteria, IEnumerable<SortingCriteria> sortingCriteria, PagingCriteria pagingCriteria);
+
+        /// <summary>
         /// Retrieves a collection of infractions, based on a given set of criteria.
         /// </summary>
         /// <param name="searchCriteria">The criteria defining which infractions are to be returned.</param>
@@ -134,7 +163,6 @@ namespace Modix.Services.Moderation
         /// Retrieves a collection of moderation actions, based on a given set of criteria.
         /// </summary>
         /// <param name="searchCriteria">The criteria defining which moderation actions are to be returned.</param>
-        /// <param name="sortingCriterias">The criteria defining how to sort the moderation actions to be returned.</param>
         /// <returns>
         /// A <see cref="Task"/> which will complete when the operation has completed,
         /// containing the requested set of moderation actions.
@@ -161,6 +189,29 @@ namespace Modix.Services.Moderation
         /// containing a flag indicating whether the moderator outranks the subject.
         /// </returns>
         Task<bool> DoesModeratorOutrankUserAsync(ulong guildId, ulong moderatorId, ulong subjectId);
+
+        /// <summary>
+        /// Determines whether there are any infractions that meet the supplied criteria.
+        /// </summary>
+        /// <param name="criteria">The criteria defining which infractions are to be searched.</param>
+        /// <exception cref="ArgumentNullException">Throws for <paramref name="criteria"/>.</exception>
+        /// <returns>
+        /// A <see cref="Task"/> that will complete when the operaiton is complete,
+        /// with a flag indicating whether there are any infractions meeting the supplied criteria.
+        /// </returns>
+        Task<bool> AnyInfractionsAsync(InfractionSearchCriteria criteria);
+
+        /// <summary>
+        /// Retrieves the designated mute role for the supplied guild or creates the role if it does not
+        /// already exist.
+        /// </summary>
+        /// <param name="guild">The guild to which the mute role belongs.</param>
+        /// <param name="currentUserId">The Discord snowflake ID of the current user.</param>
+        /// <returns>
+        /// A <see cref="Task"/> that will complete when the operation completes,
+        /// containing the designated mute role in the guild.
+        /// </returns>
+        Task<IRole> GetOrCreateDesignatedMuteRoleAsync(IGuild guild, ulong currentUserId);
     }
 
     /// <inheritdoc />
@@ -184,7 +235,8 @@ namespace Modix.Services.Moderation
             IModerationActionRepository moderationActionRepository,
             IDesignatedRoleMappingRepository designatedRoleMappingRepository,
             IInfractionRepository infractionRepository,
-            IDeletedMessageRepository deletedMessageRepository)
+            IDeletedMessageRepository deletedMessageRepository,
+            IDeletedMessageBatchRepository deletedMessageBatchRepository)
         {
             DiscordClient = discordClient;
             AuthorizationService = authorizationService;
@@ -194,6 +246,7 @@ namespace Modix.Services.Moderation
             DesignatedRoleMappingRepository = designatedRoleMappingRepository;
             InfractionRepository = infractionRepository;
             DeletedMessageRepository = deletedMessageRepository;
+            DeletedMessageBatchRepository = deletedMessageBatchRepository;
         }
 
         /// <inheritdoc />
@@ -348,7 +401,11 @@ namespace Modix.Services.Moderation
 
             if (!await UserService.GuildUserExistsAsync(guild.Id, subjectId))
             {
-                subject = new EphemeralUser(subjectId, "[FORCED]", guild);
+                subject = await UserService.GetUserInformationAsync(guild.Id, subjectId);
+
+                if (subject == null)
+                    throw new InvalidOperationException($"The given subject was not valid, ID: {subjectId}");
+
                 await UserService.TrackUserAsync(subject);
             }
             else
@@ -426,7 +483,7 @@ namespace Modix.Services.Moderation
                     new InfractionSearchCriteria()
                     {
                         GuildId = AuthorizationService.CurrentGuildId.Value,
-                        Types = new [] { type },
+                        Types = new[] { type },
                         SubjectId = subjectId,
                         IsRescinded = false,
                         IsDeleted = false,
@@ -460,17 +517,26 @@ namespace Modix.Services.Moderation
             await InfractionRepository.TryDeleteAsync(infraction.Id, AuthorizationService.CurrentUserId.Value);
 
             var guild = await DiscordClient.GetGuildAsync(infraction.GuildId);
-            var subject = await UserService.GetGuildUserAsync(guild.Id, infraction.Subject.Id);
 
             switch (infraction.Type)
             {
                 case InfractionType.Mute:
-                    await subject.RemoveRoleAsync(
-                        await GetDesignatedMuteRoleAsync(guild));
+
+                    if (await UserService.GuildUserExistsAsync(guild.Id, infraction.Subject.Id))
+                    {
+                        var subject = await UserService.GetGuildUserAsync(guild.Id, infraction.Subject.Id);
+                        await subject.RemoveRoleAsync(await GetDesignatedMuteRoleAsync(guild));
+                    }
+                    else
+                    {
+                        Log.Warning("Tried to unmute {User} while deleting mute infraction, but they weren't in the guild: {Guild}",
+                            infraction.Subject.Id, guild.Id);
+                    }
+                    
                     break;
 
                 case InfractionType.Ban:
-                    await guild.RemoveBanAsync(subject);
+                    await guild.RemoveBanAsync(infraction.Subject.Id);
                     break;
             }
         }
@@ -504,6 +570,68 @@ namespace Modix.Services.Moderation
 
                 transaction.Commit();
             }
+        }
+
+        /// <inheritdoc />
+        public async Task DeleteMessagesAsync(ITextChannel channel, int count, bool skipOne, Func<Task<bool>> confirmDelegate)
+        {
+            AuthorizationService.RequireClaims(AuthorizationClaim.ModerationMassDeleteMessages);
+
+            if (confirmDelegate is null)
+                throw new ArgumentNullException(nameof(confirmDelegate));
+
+            if (!(channel is IGuildChannel guildChannel))
+                throw new InvalidOperationException($"Cannot delete messages in {channel.Name} because it is not a guild channel.");
+
+            var confirmed = await confirmDelegate();
+
+            if (!confirmed)
+                return;
+
+            var clampedCount = Math.Clamp(count, 0, 100);
+
+            if (clampedCount == 0)
+                return;
+
+            var messages = skipOne
+                ? (await channel.GetMessagesAsync(clampedCount + 1).FlattenAsync()).Skip(1)
+                : await channel.GetMessagesAsync(clampedCount).FlattenAsync();
+
+            await DoDeleteMessagesAsync(channel, guildChannel, messages);
+        }
+
+        /// <inheritdoc />
+        public async Task DeleteMessagesAsync(ITextChannel channel, IGuildUser user, int count, Func<Task<bool>> confirmDelegate)
+        {
+            AuthorizationService.RequireClaims(AuthorizationClaim.ModerationMassDeleteMessages);
+
+            if (confirmDelegate is null)
+                throw new ArgumentNullException(nameof(confirmDelegate));
+
+            if (!(channel is IGuildChannel guildChannel))
+                throw new InvalidOperationException($"Cannot delete messages in {channel.Name} because it is not a guild channel.");
+
+            var confirmed = await confirmDelegate();
+
+            if (!confirmed)
+                return;
+
+            var clampedCount = Math.Clamp(count, 0, 100);
+
+            if (clampedCount == 0)
+                return;
+
+            var messages = (await channel.GetMessagesAsync(100).FlattenAsync()).Where(x => x.Author.Id == user.Id).Take(clampedCount);
+
+            await DoDeleteMessagesAsync(channel, guildChannel, messages);
+        }
+
+        /// <inheritdoc />
+        public async Task<RecordsPage<DeletedMessageSummary>> SearchDeletedMessagesAsync(DeletedMessageSearchCriteria searchCriteria, IEnumerable<SortingCriteria> sortingCriteria, PagingCriteria pagingCriteria)
+        {
+            AuthorizationService.RequireClaims(AuthorizationClaim.LogViewDeletedMessages);
+
+            return await DeletedMessageRepository.SearchSummariesPagedAsync(searchCriteria, sortingCriteria, pagingCriteria);
         }
 
         /// <inheritdoc />
@@ -568,12 +696,21 @@ namespace Modix.Services.Moderation
         {
             var moderator = await UserService.GetGuildUserAsync(guildId, moderatorId);
 
+            //If the user doesn't exist in the guild, we outrank them
+            if (await UserService.GuildUserExistsAsync(guildId, subjectId) == false)
+                return true;
+
+            var subject = await UserService.GetGuildUserAsync(guildId, subjectId);
+
+            //If the subject is the guild owner, and we are not the owner, we do not outrank them
+            if (subject.Guild.OwnerId == subjectId && subject.Guild.OwnerId != moderatorId)
+                return false;
+
+            //If we have the "Admin" permission, we outrank everyone in the guild but the owner
             if (moderator.GuildPermissions.Administrator)
                 return true;
 
             var rankRoles = await GetRankRolesAsync(guildId);
-
-            var subject = await UserService.GetGuildUserAsync(guildId, subjectId);
 
             var subjectRankRoles = rankRoles.Where(r => subject.RoleIds.Contains(r.Id));
             var moderatorRankRoles = rankRoles.Where(r => moderator.RoleIds.Contains(r.Id));
@@ -586,6 +723,46 @@ namespace Modix.Services.Moderation
                 : int.MinValue;
 
             return greatestSubjectRankPosition < greatestModeratorRankPosition;
+        }
+
+        public async Task<bool> AnyInfractionsAsync(InfractionSearchCriteria criteria)
+        {
+            AuthorizationService.RequireClaims(AuthorizationClaim.ModerationRead);
+
+            if (criteria is null)
+                throw new ArgumentNullException(nameof(criteria));
+
+            return await InfractionRepository.AnyAsync(criteria);
+        }
+
+        public async Task<IRole> GetOrCreateDesignatedMuteRoleAsync(IGuild guild, ulong currentUserId)
+        {
+            using (var transaction = await DesignatedRoleMappingRepository.BeginCreateTransactionAsync())
+            {
+                var mapping = (await DesignatedRoleMappingRepository.SearchBriefsAsync(new DesignatedRoleMappingSearchCriteria()
+                {
+                    GuildId = guild.Id,
+                    Type = DesignatedRoleType.ModerationMute,
+                    IsDeleted = false
+                })).FirstOrDefault();
+
+                if (!(mapping is null))
+                    return guild.Roles.First(x => x.Id == mapping.Role.Id);
+
+                var role = guild.Roles.FirstOrDefault(x => x.Name == MuteRoleName)
+                    ?? await guild.CreateRoleAsync(MuteRoleName);
+
+                await DesignatedRoleMappingRepository.CreateAsync(new DesignatedRoleMappingCreationData()
+                {
+                    GuildId = guild.Id,
+                    RoleId = role.Id,
+                    Type = DesignatedRoleType.ModerationMute,
+                    CreatedById = currentUserId
+                });
+
+                transaction.Commit();
+                return role;
+            }
         }
 
         /// <summary>
@@ -628,35 +805,10 @@ namespace Modix.Services.Moderation
         /// </summary>
         internal protected IDeletedMessageRepository DeletedMessageRepository { get; }
 
-        private async Task<IRole> GetOrCreateDesignatedMuteRoleAsync(IGuild guild, ulong currentUserId)
-        {
-            using (var transaction = await DesignatedRoleMappingRepository.BeginCreateTransactionAsync())
-            {
-                var mapping = (await DesignatedRoleMappingRepository.SearchBriefsAsync(new DesignatedRoleMappingSearchCriteria()
-                {
-                    GuildId = guild.Id,
-                    Type = DesignatedRoleType.ModerationMute,
-                    IsDeleted = false
-                })).FirstOrDefault();
-
-                if (!(mapping is null))
-                    return guild.Roles.First(x => x.Id == mapping.Role.Id);
-
-                var role = guild.Roles.FirstOrDefault(x => x.Name == MuteRoleName)
-                    ?? await guild.CreateRoleAsync(MuteRoleName);
-
-                await DesignatedRoleMappingRepository.CreateAsync(new DesignatedRoleMappingCreationData()
-                {
-                    GuildId = guild.Id,
-                    RoleId = role.Id,
-                    Type = DesignatedRoleType.ModerationMute,
-                    CreatedById = currentUserId
-                });
-
-                transaction.Commit();
-                return role;
-            }
-        }
+        /// <summary>
+        /// An <see cref="IDeletedMessageBatchRepository"/> for storing and retrieving records of deleted message batches.
+        /// </summary>
+        internal protected IDeletedMessageBatchRepository DeletedMessageBatchRepository { get; }
 
         private async Task ConfigureChannelMuteRolePermissionsAsync(IGuildChannel channel, IRole muteRole)
         {
@@ -676,6 +828,34 @@ namespace Modix.Services.Moderation
 
             await channel.AddPermissionOverwriteAsync(muteRole, _mutePermissions);
             Log.Debug("Set mute permissions for role {Role} in channel #{Channel}.", muteRole.Name, channel.Name);
+        }
+
+        private async Task DoDeleteMessagesAsync(ITextChannel channel, IGuildChannel guildChannel, IEnumerable<IMessage> messages)
+        {
+            await channel.DeleteMessagesAsync(messages);
+
+            using (var transaction = await DeletedMessageBatchRepository.BeginCreateTransactionAsync())
+            {
+                await ChannelService.TrackChannelAsync(guildChannel);
+
+                await DeletedMessageBatchRepository.CreateAsync(new DeletedMessageBatchCreationData()
+                {
+                    CreatedById = AuthorizationService.CurrentUserId.Value,
+                    GuildId = AuthorizationService.CurrentGuildId.Value,
+                    Data = messages.Select(
+                        x => new DeletedMessageCreationData()
+                        {
+                            AuthorId = x.Author.Id,
+                            ChannelId = x.Channel.Id,
+                            Content = x.Content,
+                            GuildId = AuthorizationService.CurrentGuildId.Value,
+                            MessageId = x.Id,
+                            Reason = "Mass-deleted.",
+                        }),
+                });
+
+                transaction.Commit();
+            }
         }
 
         private async Task DoRescindInfractionAsync(InfractionSummary infraction, bool isAutoRescind = false)
